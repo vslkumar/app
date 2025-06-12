@@ -1,13 +1,1 @@
-def summarize_text(jira_ids: list) -> list:
-    results = []
-    for jira_id in jira_ids:
-        story = f"""### {jira_id}
-
-**Summary:** This is a mocked summary for {jira_id}.  
-**Status:** {random.choice(statuses)}  
-**Key Actions:** {random.choice(key_actions_templates)}  
-**Assignee:** {random.choice(assignees)}  
-**Reporter:** {random.choice(reporters)}  
-
----
-"""
+Return the output in HTML format optimized for embedding in a Streamlit app. Use inline CSS styling to make the content visually appealing and mobile-responsive. Include modern fonts, padding, spacing, colors, and clean layout. Structure the response using sections, headings, and use tables or cards where needed. Avoid external CSS or JavaScript. Do not include <html>, <head>, or <body> tags — only the inner content. Make sure it's suitable for rendering with st.markdown(..., unsafe_allow_html=True).
