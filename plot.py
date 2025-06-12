@@ -1,8 +1,3 @@
-# Dynatrace Data Visualization with Streamlit
-
-Here's a complete Streamlit application that visualizes the synthetic Dynatrace data we created earlier. This provides a framework for building an interactive dashboard.
-
-```python
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -19,7 +14,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Generate synthetic data functions (same as before)
+# Generate synthetic data functions
 def generate_time_series_data():
     end_time = datetime.now()
     start_time = end_time - timedelta(hours=24)
@@ -36,7 +31,7 @@ def generate_time_series_data():
     df = pd.DataFrame({
         'timestamp': timestamps,
         'cpu_usage': cpu_usage,
-        'memory_usage': memory_usage,
+        'memory_usage': memory_usage,  # Fixed column name with underscore
         'response_time': response_time,
         'error_rate': error_rate,
         'service': ['frontend' if i % 2 == 0 else 'backend' for i in range(len(timestamps))]
@@ -69,7 +64,6 @@ def generate_topology_data():
 def generate_problems_data():
     problems = []
     severities = ['AVAILABILITY', 'ERROR', 'PERFORMANCE', 'RESOURCE']
-    statuses = ['OPEN', 'CLOSED']
     
     for i in range(10):
         start_time = datetime.now() - timedelta(hours=np.random.randint(1, 72))
@@ -175,7 +169,7 @@ if selected_service != "All":
 st.subheader("Key Metrics Overview")
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Avg CPU Usage", f"{filtered_time_series['cpu_usage'].mean():.1f}%")
-col2.metric("Avg Memory Usage", f"{filtered_time_series['memoryusage'].mean():.1f}%")
+col2.metric("Avg Memory Usage", f"{filtered_time_series['memory_usage'].mean():.1f}%")  # Fixed column name
 col3.metric("Avg Response Time", f"{filtered_time_series['response_time'].mean():.1f} ms")
 col4.metric("Avg Error Rate", f"{filtered_time_series['error_rate'].mean():.2f}%")
 
@@ -192,7 +186,7 @@ with tab1:
 
 with tab2:
     fig, ax = plt.subplots(figsize=(10, 4))
-    sns.lineplot(data=filtered_time_series, x='timestamp', y='memoryusage', hue='service', ax=ax)
+    sns.lineplot(data=filtered_time_series, x='timestamp', y='memory_usage', hue='service', ax=ax)  # Fixed column name
     ax.set_title("Memory Usage Over Time")
     ax.set_ylabel("Memory Usage (%)")
     st.pyplot(fig)
@@ -313,40 +307,3 @@ if show_user_sessions:
 # Add some space at the bottom
 st.markdown("---")
 st.caption("Synthetic data generated for Dynatrace visualization testing")
-```
-
-## How to Run the Streamlit App
-
-1. Save the code above to a file named `dynatrace_dashboard.py`
-2. Install the required packages:
-   ```
-   pip install streamlit pandas numpy matplotlib seaborn networkx
-   ```
-3. Run the Streamlit app:
-   ```
-   streamlit run dynatrace_dashboard.py
-   ```
-
-## Features of this Streamlit Dashboard:
-
-1. **Interactive Filters**:
-   - Service selection dropdown
-   - Time range slider
-   - Toggle switches for different visualization sections
-
-2. **Multiple Visualization Types**:
-   - Time series line charts for metrics
-   - Network graph for service topology
-   - Color-coded tables for problems
-   - Bar charts and histograms for user sessions
-
-3. **Responsive Layout**:
-   - Uses Streamlit's columns and tabs for organized display
-   - Adapts to different screen sizes
-
-4. **Professional Styling**:
-   - Color-coded severity indicators
-   - Clear titles and labels
-   - Consistent theming
-
-This framework provides a solid starting point that you can extend with additional Dynatrace metrics, more sophisticated visualizations, or real data integration.
