@@ -1,33 +1,70 @@
-**Role:** Act as an expert Python Backend Developer and Model Context Protocol (MCP) Architect.
+Role & Context:
+You are an expert Principal Backend Engineer specializing in Python 3.10+, async programming, and the Model Context Protocol (MCP). Your objective is to build a robust, production-ready, and generic REST API MCP server using the official mcp Python SDK (specifically leveraging the FastMCP class).
 
-**Objective:** Create a production-ready MCP server using Python and the official `mcp` Python SDK. This server allows an AI assistant to securely SSH into remote servers, extract logs asynchronously, and actively perform Root Cause Analysis (RCA) using highly flexible, parameterized log-investigation tools.
+Project Overview:
+Create a flexible MCP server that allows an AI assistant to interact with advanced REST APIs (such as Elasticsearch, Kibana, or any data-heavy API). The server must connect using dynamically configured Base URLs and Authentication methods. Crucially, it must support highly complex, deeply nested JSON query payloads (e.g., Elasticsearch Query DSL, GraphQL payloads, or complex POST bodies) without failing schema validation.
 
-**Core Requirements:**
-1. **Inputs/Configuration:** The system must manage `host`, `port`, `username`, `applicationName`, `logpath` (can be a directory or list of files), and `cluster` (e.g., dev, staging, prod).
-2. **MCP Resources (The Environment Map):**
-   - Implement an MCP `Resource` endpoint: `config://{cluster}/{applicationName}`.
-   - Returns a JSON object with connection details (`host`, `port`, `username`, standard `logpath`), allowing the LLM to understand the topology before investigating. **Never include passwords in this JSON response.**
+Technical Stack:
 
-3. **MCP Tools (The RCA & Omnipotent Grep Toolkit):** Implement the following distinct tools using `pydantic` for strict schema validation. The Python server must dynamically build the `grep` commands using these parameters to allow advanced searching without exposing raw shell access.
-   - **`advanced_log_grep` (The Core Engine):** - Arguments: `cluster` (str), `applicationName` (str), `search_pattern` (str), `use_regex` (bool, default: False), `ignore_case` (bool, default: True), `invert_match` (bool, default: False), `before_context` (int, default: 0), `after_context` (int, default: 0), `max_count` (int, default: 1000).
-     - Logic: Constructs a safe grep command. If `use_regex`, use `grep -E`. If `ignore_case`, use `grep -i`. If `invert_match`, use `grep -v`. Apply `-B` and `-A` for context, and `-m` for max count. **Always sanitize `search_pattern` using `shlex.quote()` to prevent command injection.**
-   - **`get_error_context` (Quick RCA Tool):** - Arguments: `cluster`, `applicationName`, `timestamp_or_id` (str), `context_lines` (int, default: 50).
-     - Logic: Uses `grep -C {context_lines}` to pull the logs immediately preceding and following a specific crash/timestamp.
-   - **`search_correlated_logs` (Distributed Tracing Tool):**
-     - Arguments: `cluster`, `applicationName`, `trace_id` (str).
-     - Logic: Searches across all configured log files in the `logpath` for a specific distributed Trace ID or Request ID.
+Language: Python 3.10+
 
-**Additional Python/RCA Optimizations Required:**
-1. **Secure Password & Credential Management:**
-   - Support password-based and key-based SSH authentication.
-   - Read passwords dynamically from environment variables using `python-dotenv` (e.g., `os.environ.get(f"SSH_PASSWORD_{cluster.upper()}")`). 
-   - **Crucial:** Ensure passwords are never logged to the console, never hardcoded in the `config.json`, and never returned in any MCP Resource or Tool response.
-2. **Asynchronous Connection Pooling:** Strictly use the `asyncssh` and `asyncio` libraries. Maintain an active SSH connection pool with an idle timeout so the LLM can rapidly fire multiple queries without re-authenticating every time.
-3. **JSON Log Parsing & Minimization:** If logs are JSON, use Python's `json` module to strip out noisy, irrelevant fields before returning the payload, preserving the LLM's context window.
-4. **Smart Truncation & Summarization:** Truncate massive stack traces in the middle. Keep the top (the exception) and the bottom (the root cause), adding `\n[...Stack trace truncated for LLM context...]\n`. Ensure tool outputs stay under a strict 20,000 character limit.
+SDK: mcp (using from mcp.server.fastmcp import FastMCP)
 
-**Output Structure:**
-- Provide a `requirements.txt` including `mcp`, `asyncssh`, `pydantic`, and `python-dotenv`.
-- Provide the well-commented Python code for `server.py` implementing the FastMCP or standard MCP server routing.
-- Provide a sample `config.json` (containing hosts, usernames, and log paths) and a `.env.example` file (showing how to inject the passwords).
-- Provide a `README.md` focusing on how to configure the server securely for an MCP client like Claude Desktop or GitHub Copilot.
+HTTP Client: httpx (for asynchronous, non-blocking HTTP requests)
+
+Type Hinting/Validation: Standard Python typing (Dict, Any, Optional) for FastMCP tool schema generation.
+
+Configuration & Security:
+The server must NEVER hardcode credentials. Use os.environ and python-dotenv to load the following environment variables:
+
+API_BASE_URL (e.g., http://localhost:9200 or https://api.mydomain.com)
+
+API_AUTH_TYPE (e.g., basic, bearer, or none)
+
+API_USERNAME (If using basic auth)
+
+API_PASSWORD (If using basic auth)
+
+API_BEARER_TOKEN (If using bearer auth)
+
+Required MCP Tools to Implement:
+
+execute_rest_request (The Core Query Engine)
+
+Description: Executes an HTTP request against the configured REST API. This tool is designed to handle complex queries, such as Elasticsearch match_phrase, nested aggregations, or bulk operations.
+
+Arguments:
+
+endpoint (str, required): The URL path to append to the Base URL (e.g., /my-index/_search).
+
+method (str, required): The HTTP method (GET, POST, PUT, DELETE). Default to POST.
+
+payload (Dict[str, Any], optional): The raw JSON payload/body. Critical: This must be typed flexibly so the AI can construct deeply nested JSON structures without triggering rigid Pydantic/FastMCP validation errors.
+
+query_params (Dict[str, Any], optional): URL query parameters.
+
+Implementation: Use httpx.AsyncClient to dispatch the request.
+
+fetch_api_schema_or_mapping
+
+Description: Retrieves the schema, index mapping, or OpenAPI specification from the target API.
+
+Arguments: endpoint (str, required) - e.g., /my-index/_mapping.
+
+Purpose: Allows the LLM to inspect the database structure, field names, and data types before attempting to write complex queries.
+
+check_api_health
+
+Description: Pings the root or health endpoint of the API to verify connectivity and authentication status.
+
+Key Architectural Requirements:
+
+Error Reflection: Wrap the httpx calls in try/except httpx.HTTPStatusError. If the API returns a 4xx or 5xx error (e.g., due to a malformed match_phrase query), catch it, parse the API's JSON error response, and return it directly as a string to the LLM. Do not crash the server. The LLM needs this exact error output to self-correct its JSON syntax.
+
+Async/Await Native: Ensure all tool functions defined with @mcp.tool() are async def and use httpx.AsyncClient to prevent blocking the MCP stdio transport layer.
+
+Initialization: Set up the server using mcp = FastMCP("UniversalRESTAdapter"). Start the server using mcp.run(transport="stdio") inside the if __name__ == "__main__": block so it integrates seamlessly with Claude Desktop or GitHub Copilot.
+
+Logging: Configure standard Python logging to output to sys.stderr ONLY. Printing standard output to sys.stdout will corrupt the MCP JSON-RPC protocol and break the server.
+
+Please generate the complete, well-commented server.py and requirements.txt. Include a short README section on how to configure the Claude Desktop/Cursor/Copilot JSON configuration file to run this server via the uv package manager.
