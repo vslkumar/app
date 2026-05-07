@@ -1580,5 +1580,990 @@ CGE must maintain its own test suite covering:
 
 ---
 
+## ═══════════════════════════════════════════════════════
+## SECTION 14 — HIGH-PERFORMANCE VISUALIZATION ENGINE
+## (REPLACES PYVIS — MANDATORY FOR ALL GRAPH RENDERING)
+## ═══════════════════════════════════════════════════════
+
+> **WHY THIS SECTION EXISTS:**
+> The previous Section 5 specifies `pyvis` as the primary renderer. `Pyvis` is a thin wrapper over `vis-network` with no WebGL support, no worker-threaded layouts, and catastrophic performance above ~500 nodes (freezes browser, locks UI thread, makes animations impossible). It is **BANNED** as a production renderer for CGE. This section replaces all pyvis usage with a modern, WebGL-first, React-based visualization stack that handles 500,000+ nodes with smooth 60fps animations, multi-repo layered views, and a fully interactive UI panel.
+
+---
+
+### 14.1 — Renderer Decision: Why This Exact Stack
+
+| Requirement | Why pyvis fails | Solution chosen |
+|---|---|---|
+| 50,000+ nodes | Freezes at ~500 | **Sigma.js v3** — WebGL canvas, GPU-accelerated |
+| Smooth animation | DOM-based, no RAF loop | **Graphology** + **ForceAtlas2 WebWorker** — layout runs off main thread |
+| Multi-repo layered views | Single flat graph only | **React** component tree — each repo is an isolated layer, composable |
+| Clickable detail panels | Basic tooltip only | **React** side panel with full node metadata |
+| Real-time filtering | Full re-render on filter | **Graphology** subgraph slicing — O(1) filter without re-layout |
+| Path highlighting | Not supported | **Sigma.js** programmatic edge/node color override mid-render |
+| Large graph export | Not supported | **html-to-image** + **file-saver** — PNG/SVG of current viewport |
+| Dark/light themes | Hardcoded CSS | **CSS custom properties** + **React context** theme switcher |
+| Cross-repo edge animation | Not possible | **Sigma.js** animated edge rendering with custom shaders |
+| Minimap / overview | Not supported | **react-sigma** `ControlsContainer` + `ZoomControl` + `FullScreenControl` |
+
+---
+
+### 14.2 — Definitive Technology Stack for the UI
+
+```
+cge-ui/                          ← Self-contained Vite + React app
+├── package.json
+├── vite.config.ts
+├── index.html
+└── src/
+    ├── main.tsx                 ← React root mount
+    ├── App.tsx                  ← Root component: loads graph JSON, renders views
+    ├── store/
+    │   ├── graphStore.ts        ← Zustand store — single source of truth for graph state
+    │   └── uiStore.ts           ← Zustand store — selected node, filters, theme, layout
+    ├── graph/
+    │   ├── graphology.ts        ← Graphology MultiDirectedGraph construction from CGE JSON
+    │   ├── layouts.ts           ← ForceAtlas2, Circular, Hierarchical, Radial layout runners
+    │   ├── filters.ts           ← Subgraph slicing by type / repo / role / community
+    │   ├── paths.ts             ← Shortest path, blast radius subgraph extraction
+    │   └── metrics.ts           ← Degree, centrality, community assignment
+    ├── components/
+    │   ├── GraphCanvas.tsx      ← Main Sigma.js WebGL canvas component
+    │   ├── NodeDetailPanel.tsx  ← Right-side slide-in panel on node click
+    │   ├── FilterBar.tsx        ← Top filter ribbon (type, repo, role, language toggles)
+    │   ├── SearchBar.tsx        ← Fuzzy symbol search → focus + highlight node
+    │   ├── RepoLayer.tsx        ← One per repo in multi-repo view; composable
+    │   ├── MultiRepoView.tsx    ← Hierarchical layout: upstream top, downstream bottom
+    │   ├── TaintFlowView.tsx    ← Source→sink lanes with animated flow particles
+    │   ├── BlastRadiusView.tsx  ← Concentric ring layout around selected node
+    │   ├── E2EFlowView.tsx      ← Sequential animated call chain, numbered steps
+    │   ├── DeadCodeView.tsx     ← Dead nodes only, grouped by module
+    │   ├── MiniMap.tsx          ← Overview navigator for large graphs
+    │   ├── LegendPanel.tsx      ← Color/shape key, always visible
+    │   ├── TimelineSlider.tsx   ← Temporal git history scrubber (optional)
+    │   └── ExportButton.tsx     ← PNG / SVG / JSON export
+    └── types/
+        └── graph.d.ts           ← TypeScript types mirroring Python GraphNode/GraphEdge
+```
+
+**Exact library versions to pin in `package.json`:**
+
+```json
+{
+  "dependencies": {
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "graphology": "^0.25.4",
+    "graphology-types": "^0.24.7",
+    "graphology-layout": "^0.6.1",
+    "graphology-layout-forceatlas2": "^0.10.1",
+    "graphology-layout-noverlap": "^0.4.2",
+    "graphology-shortest-path": "^2.1.0",
+    "graphology-traversal": "^0.3.1",
+    "graphology-communities-louvain": "^2.0.0",
+    "graphology-metrics": "^2.2.0",
+    "@react-sigma/core": "^4.2.1",
+    "@react-sigma/layout-forceatlas2": "^4.2.1",
+    "@react-sigma/layout-circular": "^4.2.1",
+    "sigma": "^3.0.0",
+    "zustand": "^4.5.2",
+    "framer-motion": "^11.2.0",
+    "html-to-image": "^1.11.11",
+    "file-saver": "^2.0.5",
+    "fuse.js": "^7.0.0",
+    "d3-hierarchy": "^3.1.2",
+    "d3-force": "^3.0.0",
+    "d3-scale-chromatic": "^3.1.0",
+    "react-split-pane": "^0.1.92",
+    "react-virtual": "^2.10.4",
+    "lucide-react": "^0.383.0"
+  },
+  "devDependencies": {
+    "vite": "^5.2.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "typescript": "^5.4.5"
+  }
+}
+```
+
+---
+
+### 14.3 — Core Architecture Principles
+
+#### Principle 1: Graphology as the Data Layer, Sigma as the Render Layer
+
+**NEVER** pass raw CGE JSON directly to Sigma. Always load into a `Graphology.MultiDirectedGraph` first:
+
+```typescript
+// graph/graphology.ts
+import Graph from "graphology";
+import type { CGEGraphJSON } from "../types/graph";
+
+export function buildGraphologyGraph(cgeJson: CGEGraphJSON): Graph {
+  const graph = new Graph({ multi: true, type: "directed" });
+
+  for (const node of cgeJson.nodes) {
+    graph.addNode(node.node_id, {
+      label: node.name,
+      nodeType: node.node_type,
+      role: node.role,
+      repoId: node.repo_id,
+      filePath: node.file_path,
+      startLine: node.start_line,
+      language: node.language,
+      qualifiedName: node.qualified_name,
+      metadata: node.metadata,
+      // Sigma visual properties (computed here, not hardcoded in CGE)
+      color: NODE_TYPE_COLORS[node.node_type] ?? "#888888",
+      size: computeNodeSize(node),        // degree-based, clamped 4–32px
+      borderColor: NODE_ROLE_BORDERS[node.role ?? ""] ?? "#ffffff",
+      x: Math.random() * 1000,           // Random seed; overwritten by layout
+      y: Math.random() * 1000,
+    });
+  }
+
+  for (const edge of cgeJson.edges) {
+    graph.addEdge(edge.source_id, edge.target_id, {
+      label: edge.edge_type,
+      edgeType: edge.edge_type,
+      confidence: edge.confidence,
+      weight: edge.weight,
+      color: EDGE_TYPE_COLORS[edge.edge_type] ?? "#555555",
+      size: edge.edge_type.startsWith("CROSS_REPO") ? 3 : 1,
+      // Cross-repo edges are thicker and brighter
+      isCrossRepo: edge.edge_type.startsWith("CROSS_REPO"),
+    });
+  }
+
+  return graph;
+}
+```
+
+#### Principle 2: ForceAtlas2 Layout MUST Run in a WebWorker
+
+Running ForceAtlas2 on the main thread blocks the browser UI. Use the async supervisor pattern:
+
+```typescript
+// graph/layouts.ts
+import { inferSettings } from "graphology-layout-forceatlas2";
+import FA2Layout from "graphology-layout-forceatlas2/worker";
+import type Graph from "graphology";
+
+export class LayoutManager {
+  private fa2: FA2Layout | null = null;
+
+  startForceAtlas2(graph: Graph, onComplete?: () => void) {
+    const settings = inferSettings(graph);  // Auto-tune based on graph size
+    settings.gravity = 0.05;
+    settings.scalingRatio = 10;
+    settings.slowDown = Math.max(1, Math.log(graph.order));  // Slow down for large graphs
+
+    this.fa2 = new FA2Layout(graph, {
+      settings,
+      getEdgeWeight: (edge, attrs) => attrs.weight ?? 1,
+    });
+
+    this.fa2.start();
+
+    // Auto-stop after convergence or max 10 seconds
+    const timeout = setTimeout(() => {
+      this.fa2?.stop();
+      onComplete?.();
+    }, 10000);
+
+    this.fa2.on("killed", () => {
+      clearTimeout(timeout);
+      onComplete?.();
+    });
+  }
+
+  stopLayout() {
+    this.fa2?.stop();
+    this.fa2?.kill();
+  }
+
+  applyHierarchicalLayout(graph: Graph, repoOrder: string[]) {
+    // For multi-repo view: arrange repos in vertical layers
+    // Upstream repos at top (y=0), downstream at bottom (y=max)
+    const layerHeight = 400;
+    repoOrder.forEach((repoId, layerIndex) => {
+      let xOffset = 0;
+      graph.forEachNode((node, attrs) => {
+        if (attrs.repoId === repoId) {
+          graph.setNodeAttribute(node, "y", layerIndex * layerHeight);
+          graph.setNodeAttribute(node, "x", xOffset++ * 50);
+        }
+      });
+    });
+  }
+
+  applyConcentricLayout(graph: Graph, centerNodeId: string, rings: string[][]) {
+    // For blast radius view: concentric rings
+    graph.setNodeAttribute(centerNodeId, "x", 0);
+    graph.setNodeAttribute(centerNodeId, "y", 0);
+    rings.forEach((ring, ringIndex) => {
+      const radius = (ringIndex + 1) * 200;
+      ring.forEach((nodeId, i) => {
+        const angle = (i / ring.length) * 2 * Math.PI;
+        graph.setNodeAttribute(nodeId, "x", radius * Math.cos(angle));
+        graph.setNodeAttribute(nodeId, "y", radius * Math.sin(angle));
+      });
+    });
+  }
+}
+```
+
+#### Principle 3: Sigma Canvas Component with All Interaction Handlers
+
+```typescript
+// components/GraphCanvas.tsx
+import { useEffect, useRef, useCallback } from "react";
+import { useSigma, useLoadGraph, useRegisterEvents } from "@react-sigma/core";
+import { SigmaContainer, ControlsContainer, ZoomControl, FullScreenControl } from "@react-sigma/core";
+import "@react-sigma/core/lib/react-sigma.min.css";
+import { useGraphStore } from "../store/graphStore";
+import { useUIStore } from "../store/uiStore";
+import { NodeDetailPanel } from "./NodeDetailPanel";
+import { MiniMap } from "./MiniMap";
+
+// The inner component that has access to the Sigma context
+function GraphEvents() {
+  const sigma = useSigma();
+  const { setSelectedNode, setHoveredNode, highlightedPath } = useUIStore();
+
+  useRegisterEvents({
+    // Click node → open detail panel
+    clickNode: ({ node }) => {
+      setSelectedNode(node);
+      sigma.getGraph().forEachNode((n) => {
+        sigma.getGraph().setNodeAttribute(n, "highlighted", n === node);
+      });
+      sigma.refresh({ skipIndexation: true });
+    },
+
+    // Hover node → highlight neighbors + dim everything else
+    enterNode: ({ node }) => {
+      setHoveredNode(node);
+      const neighbors = new Set(sigma.getGraph().neighbors(node));
+      sigma.getGraph().forEachNode((n) => {
+        const dim = n !== node && !neighbors.has(n);
+        sigma.getGraph().setNodeAttribute(n, "dimmed", dim);
+      });
+      sigma.getGraph().forEachEdge((edge, _attrs, source, target) => {
+        const active = source === node || target === node;
+        sigma.getGraph().setEdgeAttribute(edge, "dimmed", !active);
+      });
+      sigma.refresh({ skipIndexation: true });
+    },
+
+    // Leave node → restore all
+    leaveNode: () => {
+      setHoveredNode(null);
+      sigma.getGraph().forEachNode((n) =>
+        sigma.getGraph().setNodeAttribute(n, "dimmed", false)
+      );
+      sigma.getGraph().forEachEdge((e) =>
+        sigma.getGraph().setEdgeAttribute(e, "dimmed", false)
+      );
+      sigma.refresh({ skipIndexation: true });
+    },
+
+    // Right-click → context menu (copy qualified name, open in IDE, etc.)
+    rightClickNode: ({ node, event }) => {
+      event.preventDefault();
+      const attrs = sigma.getGraph().getNodeAttributes(node);
+      navigator.clipboard.writeText(attrs.qualifiedName);
+    },
+  });
+
+  // When a path is highlighted (from search or MCP result), animate it
+  useEffect(() => {
+    if (!highlightedPath || highlightedPath.length === 0) return;
+    const pathSet = new Set(highlightedPath);
+    sigma.getGraph().forEachNode((n) => {
+      sigma.getGraph().setNodeAttribute(n, "dimmed", !pathSet.has(n));
+      sigma.getGraph().setNodeAttribute(n, "pathHighlighted", pathSet.has(n));
+    });
+    sigma.getGraph().forEachEdge((e, _a, source, target) => {
+      sigma.getGraph().setEdgeAttribute(
+        e, "pathHighlighted",
+        pathSet.has(source) && pathSet.has(target)
+      );
+    });
+    sigma.refresh({ skipIndexation: true });
+  }, [highlightedPath]);
+
+  return null;
+}
+
+export function GraphCanvas() {
+  const { graph } = useGraphStore();
+  const { theme } = useUIStore();
+
+  if (!graph) return <div className="loading">Loading graph data...</div>;
+
+  return (
+    <div className="graph-wrapper">
+      <SigmaContainer
+        graph={graph}
+        style={{ width: "100%", height: "100vh" }}
+        settings={{
+          // WebGL renderer settings
+          renderEdgeLabels: false,          // Off by default — too cluttered
+          defaultEdgeColor: "#444",
+          defaultNodeColor: "#888",
+          labelRenderedSizeThreshold: 6,   // Only render labels when node ≥ 6px
+          labelFont: "JetBrains Mono, monospace",
+          labelSize: 11,
+          labelWeight: "600",
+          nodeProgramClasses: {
+            // Custom WebGL programs for special node shapes
+            "image": NodeImageProgram,
+          },
+          edgeProgramClasses: {
+            "arrow": EdgeArrowProgram,
+            "curved": EdgeCurvedProgram,   // Cross-repo edges use curved
+          },
+          // Performance
+          hideEdgesOnMove: true,           // CRITICAL: hides edges while panning = 60fps
+          hideLabelsOnMove: true,
+          renderLabels: true,
+          maxCameraRatio: 10,
+          minCameraRatio: 0.003,
+          zIndex: true,                    // Highlighted nodes render on top
+        }}
+      >
+        <GraphEvents />
+        <ControlsContainer position="bottom-right">
+          <ZoomControl />
+          <FullScreenControl />
+        </ControlsContainer>
+        <MiniMap />
+      </SigmaContainer>
+      <NodeDetailPanel />
+    </div>
+  );
+}
+```
+
+---
+
+### 14.4 — Multi-Repo View: Layered Architecture (`MultiRepoView.tsx`)
+
+The multi-repo view MUST render repos as visually distinct layers, NOT as a flat soup of nodes.
+
+```typescript
+// components/MultiRepoView.tsx
+//
+// Layout strategy:
+//   ┌─────────────────────────────────────────┐  ← UPSTREAM REPOS (row 0)
+//   │  [auth-svc]         [shared-models]     │
+//   └────────────┬────────────────────────────┘
+//                │  CROSS_REPO edges (animated, colored red/blue)
+//   ┌────────────▼────────────────────────────┐  ← DOWNSTREAM REPOS (row 1)
+//   │  [order-svc]        [payment-svc]       │
+//   └─────────────────────────────────────────┘
+//
+// Each repo block is a Sigma "subgraph zone" — a colored background rectangle
+// rendered as a Sigma layer BELOW the nodes, with the repo name as a large label.
+
+import { useEffect } from "react";
+import { useSigma } from "@react-sigma/core";
+import { useGraphStore } from "../store/graphStore";
+import { animateCrossRepoEdges } from "../graph/animations";
+
+export function MultiRepoView() {
+  const sigma = useSigma();
+  const { graph, repoManifest } = useGraphStore();
+
+  useEffect(() => {
+    if (!graph || !repoManifest) return;
+
+    const upstreamRepos = repoManifest.filter(r => r.role === "upstream" || r.role === "shared-lib");
+    const downstreamRepos = repoManifest.filter(r => r.role === "downstream");
+
+    // Apply hierarchical Y positioning
+    const allLayers = [upstreamRepos, downstreamRepos];
+    allLayers.forEach((layer, layerIdx) => {
+      layer.forEach((repo, repoIdx) => {
+        let xPos = repoIdx * 1200;
+        graph.forEachNode((node, attrs) => {
+          if (attrs.repoId === repo.repo_id) {
+            graph.setNodeAttribute(node, "x", xPos + (Math.random() - 0.5) * 800);
+            graph.setNodeAttribute(node, "y", layerIdx * 1200 + (Math.random() - 0.5) * 600);
+          }
+        });
+      });
+    });
+
+    // Color cross-repo edges distinctly and animate them
+    graph.forEachEdge((edge, attrs) => {
+      if (attrs.isCrossRepo) {
+        graph.setEdgeAttribute(edge, "color", "#FF0080");  // Hot pink
+        graph.setEdgeAttribute(edge, "size", 2.5);
+        graph.setEdgeAttribute(edge, "type", "curved");    // Curved to distinguish
+        graph.setEdgeAttribute(edge, "zIndex", 10);        // Always on top
+      }
+    });
+
+    // Render repo background zones as custom Sigma renderer layers
+    sigma.setSetting("nodeReducer", (node, data) => ({
+      ...data,
+      // CORE nodes: larger, brighter
+      size: data.role === "CORE" ? Math.min(data.size * 2, 32) : data.size,
+      // DEAD nodes: gray out
+      color: data.role === "DEAD" ? "#444444" : data.color,
+    }));
+
+    sigma.setSetting("edgeReducer", (edge, data) => ({
+      ...data,
+      // Cross-repo edges always visible, others dimmed when zoomed out
+      hidden: !data.isCrossRepo && sigma.getCamera().ratio > 3,
+    }));
+
+    // Animate pulsing on cross-repo edges
+    animateCrossRepoEdges(sigma, graph);
+
+    sigma.refresh();
+  }, [graph, repoManifest]);
+
+  return null;
+}
+```
+
+---
+
+### 14.5 — Animated Taint Flow View (`TaintFlowView.tsx`)
+
+The taint flow view MUST show animated particles flowing from source to sink along the taint path — not just colored edges.
+
+```typescript
+// graph/animations.ts — Particle animation system
+
+interface Particle {
+  edgeId: string;
+  progress: number;   // 0.0 → 1.0 along the edge
+  speed: number;
+  color: string;
+}
+
+export class TaintParticleAnimator {
+  private particles: Particle[] = [];
+  private animationFrame: number | null = null;
+  private sigma: Sigma;
+
+  constructor(sigma: Sigma) {
+    this.sigma = sigma;
+  }
+
+  addTaintPath(pathEdgeIds: string[], vulnerabilityClass: string) {
+    const color = VULN_CLASS_COLORS[vulnerabilityClass] ?? "#FF0000";
+    for (const edgeId of pathEdgeIds) {
+      // Add 3 particles per edge, staggered
+      for (let i = 0; i < 3; i++) {
+        this.particles.push({
+          edgeId,
+          progress: i / 3,     // Stagger start positions
+          speed: 0.008 + Math.random() * 0.004,
+          color,
+        });
+      }
+    }
+  }
+
+  start() {
+    const tick = () => {
+      // Advance all particles
+      for (const p of this.particles) {
+        p.progress += p.speed;
+        if (p.progress > 1) p.progress = 0;  // Loop
+      }
+
+      // Tell Sigma to re-render with particle positions
+      // Particles are drawn as custom WebGL points along edge paths
+      this.sigma.refresh({ skipIndexation: true });
+      this.animationFrame = requestAnimationFrame(tick);
+    };
+    this.animationFrame = requestAnimationFrame(tick);
+  }
+
+  stop() {
+    if (this.animationFrame !== null) {
+      cancelAnimationFrame(this.animationFrame);
+    }
+    this.particles = [];
+  }
+}
+```
+
+---
+
+### 14.6 — Node Detail Panel (`NodeDetailPanel.tsx`)
+
+The panel MUST slide in from the right without re-rendering the graph:
+
+```typescript
+// components/NodeDetailPanel.tsx
+import { motion, AnimatePresence } from "framer-motion";
+import { useUIStore } from "../store/uiStore";
+import { useGraphStore } from "../store/graphStore";
+import { VirtualList } from "react-virtual";
+
+export function NodeDetailPanel() {
+  const { selectedNode, setSelectedNode } = useUIStore();
+  const { graph } = useGraphStore();
+
+  if (!selectedNode || !graph) return null;
+  const attrs = graph.getNodeAttributes(selectedNode);
+
+  const callers = graph.inNeighbors(selectedNode);
+  const callees = graph.outNeighbors(selectedNode);
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        key="detail-panel"
+        className="detail-panel"
+        initial={{ x: "100%" }}
+        animate={{ x: 0 }}
+        exit={{ x: "100%" }}
+        transition={{ type: "spring", stiffness: 300, damping: 30 }}
+      >
+        {/* Header */}
+        <div className="panel-header">
+          <span className={`node-type-badge ${attrs.nodeType.toLowerCase()}`}>
+            {NODE_TYPE_ICONS[attrs.nodeType]} {attrs.nodeType}
+          </span>
+          <button onClick={() => setSelectedNode(null)}>✕</button>
+        </div>
+
+        {/* Identity */}
+        <section className="panel-section">
+          <h3>{attrs.label}</h3>
+          <code className="qualified-name">{attrs.qualifiedName}</code>
+          <div className="file-location">
+            📄 {attrs.filePath}:{attrs.startLine}
+          </div>
+        </section>
+
+        {/* Role Badge */}
+        <section className="panel-section">
+          <RoleBadge role={attrs.role} />
+          <BlastRadiusIndicator count={attrs.metadata?.blast_radius_count} />
+        </section>
+
+        {/* Signature */}
+        {attrs.metadata?.signature && (
+          <section className="panel-section">
+            <h4>Signature</h4>
+            <pre className="code-block">{attrs.metadata.signature}</pre>
+          </section>
+        )}
+
+        {/* Intent (iCPG Tier 1) */}
+        {attrs.metadata?.intent_text && (
+          <section className="panel-section intent">
+            <h4>💡 Intent</h4>
+            <p>{attrs.metadata.intent_text}</p>
+          </section>
+        )}
+
+        {/* Invariants (iCPG Tier 2) */}
+        {attrs.metadata?.invariants?.length > 0 && (
+          <section className="panel-section invariants">
+            <h4>🔒 Invariants</h4>
+            <ul>
+              {attrs.metadata.invariants.map((inv: string, i: number) => (
+                <li key={i}>{inv}</li>
+              ))}
+            </ul>
+          </section>
+        )}
+
+        {/* Taint info */}
+        {(attrs.nodeType === "TAINT_SOURCE" || attrs.nodeType === "TAINT_SINK") && (
+          <section className="panel-section taint-warning">
+            <h4>⚠️ Taint Role: {attrs.nodeType}</h4>
+            <p>Vulnerability class: {attrs.metadata?.taint_category}</p>
+          </section>
+        )}
+
+        {/* Callers — virtualized for large lists */}
+        <section className="panel-section">
+          <h4>Callers ({callers.length})</h4>
+          <VirtualList
+            size={callers.length}
+            height={150}
+            itemHeight={32}
+            renderItem={({ index, style }) => (
+              <div
+                key={callers[index]}
+                style={style}
+                className="neighbor-item"
+                onClick={() => setSelectedNode(callers[index])}
+              >
+                {graph.getNodeAttribute(callers[index], "label")}
+              </div>
+            )}
+          />
+        </section>
+
+        {/* Callees — virtualized */}
+        <section className="panel-section">
+          <h4>Callees ({callees.length})</h4>
+          <VirtualList
+            size={callees.length}
+            height={150}
+            itemHeight={32}
+            renderItem={({ index, style }) => (
+              <div
+                key={callees[index]}
+                style={style}
+                className="neighbor-item"
+                onClick={() => setSelectedNode(callees[index])}
+              >
+                {graph.getNodeAttribute(callees[index], "label")}
+              </div>
+            )}
+          />
+        </section>
+
+        {/* Git metadata */}
+        {attrs.metadata?.git_last_modified && (
+          <section className="panel-section git-meta">
+            <h4>Git</h4>
+            <div>Last modified: {attrs.metadata.git_last_modified}</div>
+            <div>Author: {attrs.metadata.git_author}</div>
+            <div>Churn count: {attrs.metadata.git_churn_count}</div>
+          </section>
+        )}
+
+        {/* Actions */}
+        <section className="panel-actions">
+          <button onClick={() => highlightBlastRadius(selectedNode)}>
+            💥 Show Blast Radius
+          </button>
+          <button onClick={() => traceToEntryPoint(selectedNode)}>
+            🔗 Trace to Entry
+          </button>
+          <button onClick={() => copyToClipboard(attrs.qualifiedName)}>
+            📋 Copy Name
+          </button>
+        </section>
+      </motion.div>
+    </AnimatePresence>
+  );
+}
+```
+
+---
+
+### 14.7 — Global Filter Bar (`FilterBar.tsx`)
+
+Filtering MUST use Graphology subgraph slicing — never re-render the full graph:
+
+```typescript
+// components/FilterBar.tsx
+// All filters mutate Sigma's `nodeReducer` and `edgeReducer` settings
+// They do NOT rebuild the graph or re-run layout
+
+export function FilterBar() {
+  const sigma = useSigma();
+  const { activeFilters, toggleFilter } = useUIStore();
+
+  const applyFilters = useCallback(() => {
+    sigma.setSetting("nodeReducer", (node, data) => {
+      const pass =
+        (activeFilters.nodeTypes.size === 0 || activeFilters.nodeTypes.has(data.nodeType)) &&
+        (activeFilters.repos.size === 0 || activeFilters.repos.has(data.repoId)) &&
+        (activeFilters.roles.size === 0 || activeFilters.roles.has(data.role)) &&
+        (activeFilters.languages.size === 0 || activeFilters.languages.has(data.language)) &&
+        (!activeFilters.hideDead || data.role !== "DEAD") &&
+        (!activeFilters.hideGenerated || !data.metadata?.is_generated);
+
+      return { ...data, hidden: !pass };
+    });
+
+    sigma.setSetting("edgeReducer", (edge, data) => {
+      const sourceHidden = sigma.getGraph().getNodeAttribute(data.source, "hidden");
+      const targetHidden = sigma.getGraph().getNodeAttribute(data.target, "hidden");
+      return { ...data, hidden: sourceHidden || targetHidden };
+    });
+
+    sigma.refresh({ skipIndexation: true });  // NO layout re-run — just re-render
+  }, [activeFilters, sigma]);
+
+  useEffect(() => { applyFilters(); }, [activeFilters]);
+
+  return (
+    <div className="filter-bar">
+      <FilterChips label="Type" options={NODE_TYPES} filterKey="nodeTypes" />
+      <FilterChips label="Repo" options={repoList} filterKey="repos" />
+      <FilterChips label="Role" options={NODE_ROLES} filterKey="roles" />
+      <FilterChips label="Language" options={LANGUAGES} filterKey="languages" />
+      <Toggle label="Hide Dead Code" filterKey="hideDead" />
+      <Toggle label="Hide Generated" filterKey="hideGenerated" />
+    </div>
+  );
+}
+```
+
+---
+
+### 14.8 — Python Backend: CGE Graph JSON Export
+
+The Python CGE backend must export the graph in a format the React UI can consume directly. Add this to `cge/visualization/json_exporter.py`:
+
+```python
+# cge/visualization/json_exporter.py
+
+import orjson
+from pathlib import Path
+from cge.graph.query_engine import GraphQueryEngine
+from cge.graph.schema import GraphNode, GraphEdge
+
+def export_graph_json(
+    engine: GraphQueryEngine,
+    output_path: Path,
+    repo_ids: list[str] | None = None,
+    include_cfg_nodes: bool = False,
+    include_dead_nodes: bool = True,
+    max_nodes: int | None = None,
+) -> None:
+    """
+    Export the graph as a single JSON file consumable by the React Sigma UI.
+    Format:
+    {
+      "meta": { "version": "1.0", "generated_at": "...", "total_nodes": N, ... },
+      "repos": [ { "repo_id": "...", "alias": "...", "role": "...", ... } ],
+      "nodes": [ { ...GraphNode fields + computed visual hints... } ],
+      "edges": [ { ...GraphEdge fields... } ],
+      "communities": [ { ... } ],
+      "taint_paths": [ { ... } ],
+      "stats": { "node_counts_by_type": {...}, "edge_counts_by_type": {...} }
+    }
+    """
+    nodes = engine.get_all_nodes(repo_ids=repo_ids)
+    edges = engine.get_all_edges(repo_ids=repo_ids)
+
+    # Filter CFG internals unless requested (they clutter the graph massively)
+    if not include_cfg_nodes:
+        cfg_types = {"CFG_ENTRY", "CFG_EXIT", "CFG_BRANCH", "CFG_LOOP", "CFG_EXCEPTION", "CFG_RETURN"}
+        nodes = [n for n in nodes if n.node_type not in cfg_types]
+        node_ids = {n.node_id for n in nodes}
+        edges = [e for e in edges if e.source_id in node_ids and e.target_id in node_ids]
+
+    if not include_dead_nodes:
+        nodes = [n for n in nodes if n.role != "DEAD"]
+
+    # Sampling for very large graphs
+    if max_nodes and len(nodes) > max_nodes:
+        nodes = _smart_sample(nodes, max_nodes)
+        node_ids = {n.node_id for n in nodes}
+        edges = [e for e in edges if e.source_id in node_ids and e.target_id in node_ids]
+
+    payload = {
+        "meta": {
+            "version": "1.0",
+            "total_nodes": len(nodes),
+            "total_edges": len(edges),
+            "sampled": max_nodes is not None and len(nodes) >= max_nodes,
+        },
+        "repos": engine.get_all_repos(repo_ids=repo_ids),
+        "nodes": [_serialize_node(n) for n in nodes],
+        "edges": [_serialize_edge(e) for e in edges],
+        "communities": engine.get_all_communities(),
+        "taint_paths": engine.get_all_taint_paths(),
+        "stats": _compute_stats(nodes, edges),
+    }
+
+    output_path.write_bytes(orjson.dumps(payload, option=orjson.OPT_INDENT_2))
+
+
+def _smart_sample(nodes: list[GraphNode], max_nodes: int) -> list[GraphNode]:
+    """Always keep ENTRY, CORE, TAINT_SOURCE, TAINT_SINK, BRIDGE nodes.
+    Fill remaining quota with highest-degree nodes."""
+    priority_roles = {"ENTRY", "CORE", "BRIDGE", "GATEWAY"}
+    priority_types = {"TAINT_SOURCE", "TAINT_SINK", "API_ENDPOINT"}
+
+    pinned = [n for n in nodes if n.role in priority_roles or n.node_type in priority_types]
+    remainder = [n for n in nodes if n not in pinned]
+    remainder.sort(key=lambda n: n.metadata.get("in_degree", 0) + n.metadata.get("out_degree", 0), reverse=True)
+
+    return pinned + remainder[:max(0, max_nodes - len(pinned))]
+```
+
+---
+
+### 14.9 — CGE UI Build and Embed Pipeline
+
+The React app is built to a single `index.html` + assets bundle and served by the Python CGE CLI:
+
+```python
+# cge/visualization/ui_server.py
+
+import subprocess
+import shutil
+import http.server
+import threading
+import webbrowser
+from pathlib import Path
+
+CGE_UI_DIR = Path(__file__).parent.parent.parent / "cge-ui"
+CGE_UI_DIST = CGE_UI_DIR / "dist"
+
+def build_ui_if_needed():
+    """Build the React app if dist/ doesn't exist or is stale."""
+    if not CGE_UI_DIST.exists():
+        subprocess.run(["npm", "install"], cwd=CGE_UI_DIR, check=True)
+        subprocess.run(["npm", "run", "build"], cwd=CGE_UI_DIR, check=True)
+
+def serve_graph(graph_json_path: Path, port: int = 7473, open_browser: bool = True):
+    """
+    Copy the graph JSON into the dist/ folder and serve with a local HTTP server.
+    The React app fetches /graph.json on load.
+    """
+    build_ui_if_needed()
+    shutil.copy(graph_json_path, CGE_UI_DIST / "graph.json")
+
+    # Serve on localhost
+    handler = http.server.SimpleHTTPRequestHandler
+    with http.server.HTTPServer(("127.0.0.1", port), handler) as httpd:
+        httpd.directory = str(CGE_UI_DIST)
+        print(f"CGE Graph UI running at: http://localhost:{port}")
+        if open_browser:
+            threading.Timer(0.5, lambda: webbrowser.open(f"http://localhost:{port}")).start()
+        httpd.serve_forever()
+```
+
+**CLI integration:**
+```bash
+# Export graph JSON and open UI
+cge graph --view full --output ./cge_graph.json --open
+
+# Serve multi-repo view
+cge graph --view multi-repo --repos auth-svc,order-svc,payment-svc --open --port 7473
+
+# E2E flow starting from an endpoint
+cge graph --view e2e --node "order_service.api.orders.create_order" --open
+```
+
+---
+
+### 14.10 — Performance Benchmarks the UI MUST Meet
+
+These are hard requirements, not aspirational targets:
+
+| Scenario | Node Count | Edge Count | Target FPS | Target Load Time |
+|---|---|---|---|---|
+| Single small repo | < 500 | < 2,000 | 60fps | < 1s |
+| Single medium repo | 5,000 | 25,000 | 60fps | < 3s |
+| Single large repo | 50,000 | 200,000 | 60fps (pan/zoom) | < 8s |
+| Multi-repo platform | 20,000 | 80,000 | 60fps | < 5s |
+| Enterprise monorepo | 200,000 | 1,000,000 | 30fps minimum | < 20s |
+| While filtering | any | any | No frame drop | < 100ms response |
+| While layout running | any | any | 60fps (worker thread) | Non-blocking |
+| Node click → panel open | any | any | Instant | < 50ms |
+| Search → highlight | any | any | Instant | < 100ms |
+
+**To meet these benchmarks, the implementation MUST:**
+- Set `hideEdgesOnMove: true` in Sigma settings — single most impactful perf setting
+- Never rebuild the Graphology graph during filter operations — only update Sigma reducers
+- Run ForceAtlas2 in a WebWorker — ALWAYS, no exceptions
+- Use `sigma.refresh({ skipIndexation: true })` for color/visibility updates — 10x faster than full refresh
+- Use `react-virtual` (or `@tanstack/virtual`) for all lists in the detail panel — never render > 100 DOM nodes at once
+- Lazy-load the graph JSON with streaming fetch — show partial graph while rest loads
+- For graphs > 100,000 nodes, disable label rendering by default (`renderLabels: false`) and only enable on zoom-in past a threshold camera ratio
+
+---
+
+### 14.11 — Visual Design Specification
+
+```css
+/* Design tokens — applied as CSS custom properties */
+:root {
+  /* Dark theme (default) */
+  --bg-primary: #0d0d0f;
+  --bg-panel: #16161a;
+  --bg-panel-hover: #1e1e24;
+  --border: #2a2a35;
+  --text-primary: #e8e8f0;
+  --text-secondary: #8888a0;
+  --text-code: #a8d8a8;
+  --accent-blue: #4a9eff;
+  --accent-orange: #ff8c42;
+  --accent-red: #ff4d6d;
+  --accent-green: #52c77e;
+  --accent-purple: #b07fff;
+  --accent-yellow: #ffd166;
+  --cross-repo-edge: #ff0080;
+  --taint-source: #52c77e;
+  --taint-sink: #ff4d6d;
+  --taint-path: #ff8c00;
+  --core-node: #ff6b35;
+  --entry-node: #4a9eff;
+  --dead-node: #3a3a45;
+
+  /* Typography */
+  --font-ui: "Inter Variable", "Inter", system-ui, sans-serif;
+  --font-code: "JetBrains Mono", "Fira Code", monospace;
+
+  /* Sizing */
+  --panel-width: 380px;
+  --filter-bar-height: 52px;
+  --border-radius: 8px;
+}
+
+/* Node type → color mapping (also used in Graphology attrs) */
+/* These must be kept in sync between CSS and NODE_TYPE_COLORS constant in TypeScript */
+```
+
+**Node shape → WebGL program mapping:**
+
+| NodeType | Sigma Program | Visual Shape |
+|---|---|---|
+| `FUNCTION`, `METHOD` | `NodeCircleProgram` | Circle |
+| `CLASS`, `INTERFACE` | `NodeBorderProgram` | Circle with thick border |
+| `API_ENDPOINT`, `API_ROUTE` | `NodeSquareProgram` | Diamond (rotated square) |
+| `DB_TABLE`, `DB_VIEW` | `NodeCircleProgram` + cylinder icon | Circle with DB icon |
+| `TAINT_SOURCE` | `NodeTriangleProgram` | Upward triangle |
+| `TAINT_SINK` | `NodeTriangleProgram` (inverted) | Downward triangle |
+| `COMMUNITY` | `NodeStarProgram` | Star |
+| `REPOSITORY` | `NodeBorderProgram` (hexagon approx.) | Large hexagon |
+| `DEAD` (any type) | any, color overridden | Gray, dashed border |
+| `CROSS_REPO_SYMBOL` | `NodeCircleProgram` | Circle with glow effect |
+
+---
+
+### 14.12 — Updated Directory Structure (Adds `cge-ui/`)
+
+```
+codegraphengine/
+├── cge/                              ← Python backend (unchanged from Section 1.3)
+│   └── visualization/
+│       ├── json_exporter.py          ← NEW: exports graph.json for React UI
+│       └── ui_server.py              ← NEW: serves React UI locally
+│
+├── cge-ui/                           ← NEW: React + Sigma.js frontend
+│   ├── package.json
+│   ├── vite.config.ts
+│   ├── tsconfig.json
+│   ├── index.html
+│   └── src/
+│       ├── main.tsx
+│       ├── App.tsx
+│       ├── store/
+│       ├── graph/
+│       ├── components/
+│       └── types/
+│
+├── pyproject.toml
+└── cge.config.yaml
+```
+
+The `cge-ui/dist/` is built once during `pip install` (via a `build` hook in `pyproject.toml`) and bundled as package data, so end users running `pip install codegraphengine` get the full UI with zero separate npm install required.
+
+---
+
 *End of PROMPT — CodeGraphEngine (CGE) Complete Specification*
-*Version: 1.0.0 | Compiled from research on: graphify, graphiti, codebadger, mcp-joern, code-intel-mcp, Fraunhofer CPG, TheAuditor, depwire, claude-bootstrap (iCPG), codebase-summary-bot, mco, Optave codegraph, shannon, Joern, ArangoDB, and related ecosystem tools.*
+*Version: 2.0.0 | Section 14 added: High-Performance Visualization Engine (Sigma.js v3 + Graphology + React)*
+*Compiled from research on: graphify, graphiti, codebadger, mcp-joern, code-intel-mcp, Fraunhofer CPG, TheAuditor, depwire, claude-bootstrap (iCPG), codebase-summary-bot, mco, Optave codegraph, shannon, Joern, ArangoDB, Sigma.js, Graphology, react-sigma, ForceAtlas2, and related ecosystem tools.*
